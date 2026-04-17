@@ -1,0 +1,22 @@
+{
+  "name": "lmsr-example",
+  "version": "1.0.0",
+  "description": "Typescript CLI LMSR prediction market simulation",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com-vkpatva:vkpatva/LMSR-Example.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@types/node": "^25.6.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  }
+}
