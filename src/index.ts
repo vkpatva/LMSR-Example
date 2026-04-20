@@ -3,11 +3,20 @@ import * as fs from "fs";
 import * as path from "path";
 
 const DEFAULT_B = 900;
-const TRANSACTION_FEE_RATE = 0.015;
+const PRE_GAME_MULTIPLIER = 0.75;
 const INITIAL_USER_BALANCE = 1000;
 const USER_COUNT = 7;
 const OUTCOMES = ["RCB", "CSK"] as const;
 type Outcome = (typeof OUTCOMES)[number];
+type PriceFeeTier = { maxPrice: number; baseRate: number };
+
+const PRICE_FEE_TIERS: PriceFeeTier[] = [
+  { maxPrice: 0.3, baseRate: 0.005 },
+  { maxPrice: 0.6, baseRate: 0.01 },
+  { maxPrice: 0.8, baseRate: 0.02 },
+  { maxPrice: 0.9, baseRate: 0.025 },
+  { maxPrice: Number.POSITIVE_INFINITY, baseRate: 0.03 }
+];
 
 type User = {
   id: string;
@@ -60,12 +69,14 @@ class LMSRMarket {
   private readonly tradeHistory: TradeRecord[];
   private resolveRecord: ResolveRecord | null;
   private readonly stateFilePath: string;
+  private gameStartTimestamp: number | null;
 
   constructor(b: number) {
     this.b = b;
     this.totalShares = { RCB: 0, CSK: 0 };
     this.tradeHistory = [];
     this.resolveRecord = null;
+    this.gameStartTimestamp = null;
     this.users = new Map<string, User>();
     this.stateFilePath = path.resolve(process.cwd(), "market-state.json");
     this.loadStateOrInitialize();
@@ -117,6 +128,75 @@ class LMSRMarket {
       users: Array.from(this.users.values())
     };
     fs.writeFileSync(this.stateFilePath, JSON.stringify(state, null, 2));
+  }
+
+  private getPriceBaseRate(price: number): number {
+    for (const tier of PRICE_FEE_TIERS) {
+      if (price <= tier.maxPrice) {
+        return tier.baseRate;
+      }
+    }
+
+    return PRICE_FEE_TIERS[PRICE_FEE_TIERS.length - 1].baseRate;
+  }
+
+  private getInGameHourNumber(nowMs = Date.now()): number {
+    if (!this.gameStartTimestamp) {
+      return 1;
+    }
+
+    const elapsedMs = Math.max(0, nowMs - this.gameStartTimestamp);
+    const elapsedHours = elapsedMs / (60 * 60 * 1000);
+    if (elapsedHours < 1) {
+      return 1;
+    }
+    if (elapsedHours < 2) {
+      return 2;
+    }
+    if (elapsedHours < 3) {
+      return 3;
+    }
+    return 4;
+  }
+
+  private getTimeMultiplier(hourNumber: number): number {
+    if (hourNumber <= 1) {
+      return 1.0;
+    }
+    if (hourNumber === 2) {
+      return 1.5;
+    }
+    if (hourNumber === 3) {
+      return 2.5;
+    }
+    return 4.0;
+  }
+
+  private getTradeFeeRate(outcomePrice: number, nowMs = Date.now()): number {
+    const baseRate = this.getPriceBaseRate(outcomePrice);
+    if (!this.gameStartTimestamp) {
+      return baseRate * PRE_GAME_MULTIPLIER;
+    }
+
+    const hourNumber = this.getInGameHourNumber(nowMs);
+    const multiplier = this.getTimeMultiplier(hourNumber);
+    return baseRate * multiplier;
+  }
+
+  private formatFeeRate(rate: number): string {
+    return `${(rate * 100).toFixed(2)}%`;
+  }
+
+  startGame(): { success: boolean; message: string } {
+    if (this.resolveRecord) {
+      return { success: false, message: "Cannot start game after market resolution." };
+    }
+    if (this.gameStartTimestamp) {
+      return { success: false, message: "Game already started." };
+    }
+
+    this.gameStartTimestamp = Date.now();
+    return { success: true, message: "Game started. Time-based fee multipliers are now active." };
   }
 
   private getLogSumExp(shares: Record<Outcome, number>): number {
@@ -223,7 +303,9 @@ class LMSRMarket {
     const newShares = { ...this.totalShares, [outcome]: this.totalShares[outcome] + quantity };
     const newCost = this.getPoolCost(newShares);
     const grossCost = newCost - currentCost;
-    const fee = grossCost * TRANSACTION_FEE_RATE;
+    const pricesBeforeTrade = this.getPrices();
+    const feeRate = this.getTradeFeeRate(pricesBeforeTrade[outcome]);
+    const fee = grossCost * feeRate;
     const totalCostToUser = grossCost + fee;
 
     if (user.balance < totalCostToUser) {
@@ -255,7 +337,7 @@ class LMSRMarket {
       success: true,
       message: `Trade executed. ${userId} bought ${quantity} ${outcome} shares | Gross: $${grossCost.toFixed(
         2
-      )}, Fee (1.5%): $${fee.toFixed(2)}, Total: $${totalCostToUser.toFixed(2)}`
+      )}, Fee (${this.formatFeeRate(feeRate)}): $${fee.toFixed(2)}, Total: $${totalCostToUser.toFixed(2)}`
     };
   }
 
@@ -275,7 +357,9 @@ class LMSRMarket {
     }
 
     const grossPayout = quote.payout;
-    const fee = grossPayout * TRANSACTION_FEE_RATE;
+    const pricesBeforeTrade = this.getPrices();
+    const feeRate = this.getTradeFeeRate(pricesBeforeTrade[outcome]);
+    const fee = grossPayout * feeRate;
     const netPayout = grossPayout - fee;
 
     user.balance += netPayout;
@@ -298,7 +382,7 @@ class LMSRMarket {
       success: true,
       message: `Trade executed. ${userId} sold ${quantity} ${outcome} shares | Gross: $${grossPayout.toFixed(
         2
-      )}, Fee (1.5%): $${fee.toFixed(2)}, Net: $${netPayout.toFixed(2)}`
+      )}, Fee (${this.formatFeeRate(feeRate)}): $${fee.toFixed(2)}, Net: $${netPayout.toFixed(2)}`
     };
   }
 
@@ -340,6 +424,9 @@ class LMSRMarket {
       : this.getPrices();
 
     console.log("\n===== SCOREBOARD =====");
+    console.log(
+      `Game Status: ${this.gameStartTimestamp ? `IN-GAME (hour ${this.getInGameHourNumber()})` : "PRE-GAME (0.75x of hour-1 price base fee)"}`
+    );
     console.log(`Prices -> P(RCB): ${prices.RCB.toFixed(4)} | P(CSK): ${prices.CSK.toFixed(4)}`);
     console.log(`Total Shares -> RCB: ${this.totalShares.RCB.toFixed(2)} | CSK: ${this.totalShares.CSK.toFixed(2)}`);
     console.log(`Total Fees Collected: $${this.getTotalFeesCollected().toFixed(2)}`);
@@ -361,6 +448,18 @@ class LMSRMarket {
     }
 
     console.log("======================\n");
+  }
+
+  printFeeTable(): void {
+    console.log("\n===== FEE TABLE =====");
+    console.log("| Price Range | Pre-Game (0.75x H1) | Hour 1 (1.0x) | Hour 2 (1.5x) | Hour 3 (2.5x) | Hour 4+ (4.0x) |");
+    console.log("|-------------|----------------------|---------------|---------------|---------------|----------------|");
+    console.log("| Price <= 0.30 | 0.375% | 0.50% | 0.75% | 1.25% | 2.00% |");
+    console.log("| 0.30 < Price <= 0.60 | 0.75% | 1.00% | 1.50% | 2.50% | 4.00% |");
+    console.log("| 0.60 < Price <= 0.80 | 1.50% | 2.00% | 3.00% | 5.00% | 8.00% |");
+    console.log("| 0.80 < Price <= 0.90 | 1.875% | 2.50% | 3.75% | 6.25% | 10.00% |");
+    console.log("| Price > 0.90 | 2.25% | 3.00% | 4.50% | 7.50% | 12.00% |");
+    console.log("=====================\n");
   }
 
   printTradeHistory(): void {
@@ -389,6 +488,7 @@ class LMSRMarket {
     this.totalShares.CSK = 0;
     this.tradeHistory.length = 0;
     this.resolveRecord = null;
+    this.gameStartTimestamp = null;
     this.users.clear();
     for (const user of this.initializeUsers()) {
       this.users.set(user.id, user);
@@ -403,6 +503,8 @@ class LMSRMarket {
     console.log("  quote <QUANTITY>                        show buy quote for both outcomes");
     console.log("  quote <RCB|CSK> <QUANTITY>              show buy quote for one outcome");
     console.log("  quote sell <USER_ID> <RCB|CSK> <QTY>    show sell quote for one outcome");
+    console.log("  start                                   start in-game timer for fee multipliers");
+    console.log("  fee-table                               show current fee structure");
     console.log("  resolve <RCB|CSK>                       e.g., resolve CSK");
     console.log("  reset                                   clear state and start new market");
     console.log("  scoreboard                              show current market state");
@@ -557,6 +659,15 @@ function bootstrap(): void {
         market.printScoreboard();
         break;
       }
+      case "start": {
+        const result = market.startGame();
+        console.log(result.message);
+        market.printScoreboard();
+        break;
+      }
+      case "fee-table":
+        market.printFeeTable();
+        break;
       case "scoreboard":
         market.printScoreboard();
         break;
